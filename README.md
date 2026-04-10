@@ -1,137 +1,83 @@
-# Tetris Simplificado - ESP32 + Matriz LED 8x8 Bicolor
+# Tetris — ESP32 en Matriz LED 7×5
 
-Laboratorio 2 - Sistemas Embebidos  
-Universidad EIA - 2026-1  
-Profesor: Juan José Londoño
-
-## Descripción
-
-Videojuego Tetris simplificado (sin rotación de piezas) implementado en un ESP32 con una matriz LED 8x8 bicolor SBM-2388ASRG y 2 registros de desplazamiento 74HC595.
-
-### Características
-- 5 tipos de piezas: línea (1x3), cuadrado (2x2), L, L invertida, T
-- Sin rotación de piezas
-- Colores: verde (pieza activa), rojo (piezas colocadas), amarillo (flash al eliminar línea)
-- Velocidad de caída aumenta progresivamente
-- Animación de game over
-- Reinicio con cualquier botón
+Implementación de un Tetris simplificado corriendo sobre un ESP32 DevKit, usando una matriz de LEDs bicolor (rojo/verde) de 7 filas × 5 columnas, controlada por multiplexación por filas.
 
 ## Hardware
 
 ### Componentes
-| Componente | Cantidad | Función |
-|---|---|---|
-| ESP32-WROOM (30 pines) | 1 | Microcontrolador |
-| Matriz LED 8x8 SBM-2388ASRG | 1 | Display bicolor |
-| 74HC595 (shift register) | 2 | Manejar 16 columnas con 3 GPIOs |
-| Resistencia 100Ω | 8 | Limitar corriente en filas |
-| Resistencia 10kΩ | 3 | Pull-down para botones |
-| Pulsador | 3 | Controles del juego |
-| Condensador 100nF | 2 | Desacoplo para cada 595 |
 
-### Circuito - Conexiones ESP32
+- ESP32 
+- Matriz LED bicolor 7×5 (ánodo común por fila)
+- 3 pulsadores (izquierda, derecha, drop)
+- Resistencias limitadoras según los LEDs utilizados
+- Protoboard y cableado
 
-#### Filas de la matriz (ánodo común) → Resistencia 100Ω → Pin de la matriz
-| GPIO ESP32 | Fila | Pin matriz |
-|------------|------|------------|
-| GPIO 4     | ROW1 | 9          |
-| GPIO 16    | ROW2 | 14         |
-| GPIO 17    | ROW3 | 8          |
-| GPIO 18    | ROW4 | 12         |
-| GPIO 19    | ROW5 | 1          |
-| GPIO 21    | ROW6 | 7          |
-| GPIO 22    | ROW7 | 2          |
-| GPIO 23    | ROW8 | 5          |
+### Conexiones
 
-#### 74HC595 - Control desde ESP32
-| GPIO ESP32 | Señal | Pin 595 #1 | Descripción |
-|------------|-------|------------|-------------|
-| GPIO 13    | DATA  | Pin 14 (DS)   | Datos serie |
-| GPIO 14    | CLOCK | Pin 11 (SHCP) | Reloj de desplazamiento |
-| GPIO 27    | LATCH | Pin 12 (STCP) | Transferir a salidas |
+| Función | GPIOs |
+|---|---|
+| Filas (ánodos, 7) | 16, 17, 18, 19, 21, 22, 23 |
+| Columnas rojas (5) | 27, 26, 25, 33, 5 |
+| Columnas verdes (4) | 4, 15, 2, 32 |
+| Botón izquierda | 13 (pull-up interno) |
+| Botón derecha | 14 (pull-up interno) |
+| Botón drop | 12 (pull-up interno) |
 
-#### Cableado de los 74HC595
+> Los LEDs verdes solo están disponibles en las primeras 4 columnas. La columna 5 solo tiene rojo.
 
-Los dos 595 van en cascada (daisy chain):
+### Lógica de activación
 
-**595 #1 (columnas verdes):**
-| Pin 595 #1 | Conexión |
-|------------|----------|
-| Pin 14 (DS)   | GPIO 13 del ESP32 |
-| Pin 11 (SHCP) | GPIO 14 del ESP32 |
-| Pin 12 (STCP) | GPIO 27 del ESP32 |
-| Pin 13 (OE)   | GND (siempre habilitado) |
-| Pin 10 (MR)   | 3.3V (nunca resetear) |
-| Pin 16 (VCC)  | 3.3V |
-| Pin 8 (GND)   | GND |
-| Pin 9 (Q7S)   | Pin 14 (DS) del 595 #2 |
-| Q0-Q7         | Cátodos verdes CG1-CG8 (pines 24,23,22,21,20,19,18,17 de la matriz) |
+- **Filas:** se activan en alto (1 = encendida).
+- **Columnas:** activas en bajo (0 = LED encendido). Se apagan con 1.
+- Se multiplexa fila por fila con un retardo de 700 µs por fila.
 
-**595 #2 (columnas rojas):**
-| Pin 595 #2 | Conexión |
-|------------|----------|
-| Pin 14 (DS)   | Pin 9 (Q7S) del 595 #1 |
-| Pin 11 (SHCP) | GPIO 14 del ESP32 (mismo clock) |
-| Pin 12 (STCP) | GPIO 27 del ESP32 (mismo latch) |
-| Pin 13 (OE)   | GND |
-| Pin 10 (MR)   | 3.3V |
-| Pin 16 (VCC)  | 3.3V |
-| Pin 8 (GND)   | GND |
-| Q0-Q7         | Cátodos rojos CR1-CR8 (pines 13,3,4,10,6,11,15,16 de la matriz) |
+## Piezas
 
-**Condensadores de desacoplo:** 100nF entre VCC y GND de cada 595, lo más cerca posible del chip.
+El juego incluye 5 tipos de pieza, cada una definida por sus celdas relativas a la posición `(y, x)`:
 
-#### Botones (con pull-down externo de 10kΩ)
-| GPIO ESP32 | Función |
-|------------|---------|
-| GPIO 36 (VP) | Mover izquierda |
-| GPIO 39 (VN) | Mover derecha |
-| GPIO 34       | Hard drop |
+```
+Tipo 0 (T)     Tipo 1 (cuadrado)   Tipo 2 (línea)   Tipo 3 (L izq)   Tipo 4 (L der)
 
-Conexión de cada botón: un terminal a 3.3V, el otro terminal al GPIO + resistencia 10kΩ a GND.
-
-## Software
-
-### Requisitos
-- ESP-IDF (v4.4 o superior)
-
-### Compilar y flashear
-```bash
-idf.py set-target esp32
-idf.py build
-idf.py -p /dev/ttyUSB0 flash monitor
+   . X .            X X                  X               X .              . X
+   X X X            X X                  X               X X              X X
+                                         X               X .              . X
 ```
 
-### Estructura del proyecto
-```
-tetris-esp32/
-├── CMakeLists.txt
-├── README.md
-├── .gitignore
-└── main/
-    ├── CMakeLists.txt
-    └── main.c
-```
-
-### APIs de ESP-IDF utilizadas
-- `driver/gpio.h`: gpio_config(), gpio_set_level(), interrupciones GPIO con gpio_isr_handler_add()
-- `driver/timer.h`: timer hardware con alarma e ISR para caída periódica
-- `freertos/FreeRTOS.h` y `freertos/task.h`: soporte del RTOS
-- `esp_timer.h`: esp_timer_get_time() para debounce en ISR
-
-### Técnicas implementadas
-- **74HC595 sin librería**: controlado bit a bit con gpio_set_level() (DATA, CLOCK, LATCH)
-- **Multiplexado por filas** de la matriz LED (~500 Hz refresh)
-- **Interrupciones externas** (GPIO ISR) para los botones con debounce por software
-- **Timer hardware** con alarma e ISR para la caída periódica de las piezas
-- **Variables volatile** para comunicación ISR ↔ bucle principal
-- **IRAM_ATTR** en todas las ISR
+Las piezas no rotan; solo se mueven lateralmente y caen.
 
 ## Controles
 
-| Botón     | Acción |
-|-----------|--------|
-| Izquierda | Mover pieza a la izquierda |
-| Derecha   | Mover pieza a la derecha |
-| Drop      | Bajar pieza instantáneamente |
-| Cualquiera| Reiniciar (en game over) |
+| Botón | Acción |
+|---|---|
+| Izquierda (GPIO 13) | Mover pieza a la izquierda |
+| Derecha (GPIO 14) | Mover pieza a la derecha |
+| Drop (GPIO 12) | Acelerar la caída (mantener presionado) |
+
+Los botones se leen por polling dentro del loop principal. Se usa un contador de movimiento (`contador_mov > 20`) para evitar que la pieza se desplace demasiado rápido al mantener presionado un botón lateral.
+
+## Mecánicas
+
+- Las piezas aparecen en la parte superior (y = −3) y caen automáticamente.
+- Al colisionar con el fondo o con piezas fijadas, la pieza se ancla al tablero.
+- Si una fila queda completamente llena, se reproduce una animación de parpadeo en verde y luego se elimina, aplicando gravedad bloque a bloque hacia abajo.
+- La condición de **Game Over** se evalúa al inicio de cada nueva pieza: si hay al menos una celda ocupada en la fila 0, se muestra una animación de dos "X" verdes parpadeantes y el tablero se reinicia.
+
+## Estructura del código
+
+| Sección | Descripción |
+|---|---|
+| `configurar_pines()` | Inicializa GPIOs de filas, columnas y botones |
+| `mostrar_pantalla()` | Multiplexación de la matriz (1 frame completo) |
+| `dibujar_pieza()` | Escribe una pieza en el buffer `pantalla` |
+| `colision()` | Verifica si una pieza puede ocupar una posición |
+| `fijar_pieza()` | Ancla la pieza al tablero y revisa filas completas |
+| `revisar_filas()` | Busca y elimina filas llenas con animación |
+| `aplicar_gravedad_completa()` | Baja bloques flotantes tras eliminar una fila |
+| `animacion_game_over_x()` | Parpadeo de "X" verdes al perder |
+| `juego()` | Loop principal del juego |
+| `app_main()` | Punto de entrada ESP-IDF |
+
+## Build
+
+Proyecto ESP-IDF estándar. Compilar y flashear con:
+
