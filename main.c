@@ -1,570 +1,529 @@
-#include <stdio.h>
-#include <string.h>
-#include <stdbool.h>
- 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
-#include "driver/timer.h"
-#include "esp_timer.h"
+#include "esp_rom_sys.h"
+#include <stdlib.h>
+#include <stdint.h>
 
+#define NUM_FILAS 7
+#define NUM_COLS  5
+#define NUM_COLS_VERDE 4
 
-static const gpio_num_t ROW_PINS[8] = {
-    GPIO_NUM_4,  GPIO_NUM_16, GPIO_NUM_17, GPIO_NUM_18, GPIO_NUM_19, GPIO_NUM_21, GPIO_NUM_22, GPIO_NUM_23
+// -------------------------
+// PINES MATRIZ
+// -------------------------
+gpio_num_t filas[NUM_FILAS] = {
+    GPIO_NUM_16, GPIO_NUM_17, GPIO_NUM_18, GPIO_NUM_19,
+    GPIO_NUM_21, GPIO_NUM_22, GPIO_NUM_23
 };
 
-/* 74HC595 control (3 pines) */
-#define SR_DATA    GPIO_NUM_13
-#define SR_CLOCK   GPIO_NUM_14
-#define SR_LATCH   GPIO_NUM_27
-
-/* Botones (input-only, pull-down externo 10k) */
-#define BTN_LEFT   GPIO_NUM_36
-#define BTN_RIGHT  GPIO_NUM_39
-#define BTN_DROP   GPIO_NUM_34
-
-#define BOARD_W    8
-#define BOARD_H    8
-#define NUM_PIECES 5
- 
-/* Debounce para polling (ms) */
-#define DEBOUNCE_MS 180
- 
-/* Timer de caida */
-#define FALL_TIMER_GROUP   TIMER_GROUP_0
-#define FALL_TIMER_IDX     TIMER_0
-#define FALL_TIMER_DIVIDER 80        /* 80MHz/80 = 1MHz, 1 tick = 1us */
-#define FALL_INTERVAL_US   600000    /* 600ms velocidad inicial */
-
-/* ================================================================
- * PIEZAS (sin rotacion)
- * ================================================================ */
- 
-typedef struct {
-    int blocks[4][2];   /* {fila_offset, col_offset} */
-    int num_blocks;
-    int width;
-} piece_t;
-
-
-static const piece_t PIECES[NUM_PIECES] = {
-    /* 0: Linea 1x3  ###           */
-    { .blocks={{0,0},{0,1},{0,2},{0,0}}, .num_blocks=3, .width=3 },
-    /* 1: Cuadrado 2x2  ##         */
-    /*                   ##         */
-    { .blocks={{0,0},{0,1},{1,0},{1,1}}, .num_blocks=4, .width=2 },
-    /* 2: L   #                     */
-    /*        ##                    */
-    { .blocks={{0,0},{1,0},{1,1},{0,0}}, .num_blocks=3, .width=2 },
-    /* 3: L invertida  #            */
-    /*                ##            */
-    { .blocks={{0,1},{1,0},{1,1},{0,0}}, .num_blocks=3, .width=2 },
-    /* 4: T  ###                    */
-    /*        #                     */
-    { .blocks={{0,0},{0,1},{0,2},{1,1}}, .num_blocks=4, .width=3 }
+// Juego normal en rojo
+gpio_num_t columnas_rojo[NUM_COLS] = {
+    GPIO_NUM_27, GPIO_NUM_26, GPIO_NUM_25, GPIO_NUM_33, GPIO_NUM_5
 };
 
-/* ================================================================
- * ESTADO DEL JUEGO
- * ================================================================ */
+// Verde real disponible solo en 4 columnas
+gpio_num_t columnas_verde[NUM_COLS_VERDE] = {
+    GPIO_NUM_4, GPIO_NUM_15, GPIO_NUM_2, GPIO_NUM_32
+};
 
- static uint8_t board[BOARD_H][BOARD_W];  /* 0=vacio, 1=ocupado */
-static int cur_piece;                     /* indice de pieza actual */
-static int piece_row, piece_col;          /* posicion de la pieza */
- 
-static uint8_t disp_red[BOARD_H];         /* buffer rojo (1 bit/col) */
-static uint8_t disp_green[BOARD_H];       /* buffer verde */
- 
-static volatile bool game_over    = false;
-static volatile bool flash_active = false;
-static uint8_t flash_rows_mask   = 0;
-static int     flash_count       = 0;
-static int     score             = 0;
-static uint64_t fall_interval_us = FALL_INTERVAL_US;
+// -------------------------
+// BOTONES
+// -------------------------
+#define BTN_IZQ   GPIO_NUM_13
+#define BTN_DER   GPIO_NUM_14
+#define BTN_DROP  GPIO_NUM_12
 
-/* Flag de caida - lo activa la ISR del timer */
-static volatile bool flag_fall = false;
- 
-/* RNG simple (xorshift) */
-static uint32_t rng_state = 12345;
+// -------------------------
+// MATRICES
+// 0 = apagado
+// 1 = rojo
+// 2 = verde
+// -------------------------
+uint8_t pantalla[NUM_FILAS][NUM_COLS];
+uint8_t tablero[NUM_FILAS][NUM_COLS];
 
-/* ================================================================
- * RNG
- * ================================================================ */
-
-static uint32_t rng_next(void) {
-    rng_state ^= rng_state << 13;
-    rng_state ^= rng_state >> 17;
-    rng_state ^= rng_state << 5;
-    return rng_state;
-}
- 
-static int random_piece(void) {
-    return (int)(rng_next() % NUM_PIECES);
-}
-
-
-/* ================================================================
- * ISR DEL TIMER (caida periodica)
- *
- * Retorna bool como se vio en clase.
- * Solo activa una bandera volatile, sin logica pesada.
- * ================================================================ */
- 
-
-static bool IRAM_ATTR timer_fall_isr(void *args) {
-    flag_fall = true;
-    return false;
-}
-
-
-
-/* ================================================================
- * 74HC595 - SHIFT REGISTER
- *
- * 2 x 74HC595 en cascada (daisy chain):
- *   ESP32 --DATA--> 595 #1 (col verdes) --Q7S--> 595 #2 (col rojas)
- *   ESP32 --CLOCK--> ambos (pin 11)
- *   ESP32 --LATCH--> ambos (pin 12)
- *
- * Se envian 16 bits con gpio_set_level():
- *   - Primero 8 bits de rojo (pasan al 595 #2)
- *   - Luego 8 bits de verde (quedan en 595 #1)
- *
- * Catodo LOW = LED encendido, por eso se invierte la data.
- * ================================================================ */
- 
-static void sr_send_16bits(uint8_t red_data, uint8_t green_data) {
-    uint8_t red_inv   = ~red_data;
-    uint8_t green_inv = ~green_data;
- 
-    /* Enviar rojo primero (se desplaza al 595 #2) */
-    for (int i = 7; i >= 0; i--) {
-        gpio_set_level(SR_DATA, (red_inv >> i) & 1);
-        gpio_set_level(SR_CLOCK, 0);
-        gpio_set_level(SR_CLOCK, 1);
+// -------------------------
+// CONFIGURACIÓN
+// -------------------------
+void configurar_pines(void)
+{
+    for (int f = 0; f < NUM_FILAS; f++) {
+        gpio_reset_pin(filas[f]);
+        gpio_set_direction(filas[f], GPIO_MODE_OUTPUT);
+        gpio_set_level(filas[f], 0);
     }
-    /* Enviar verde (queda en 595 #1) */
-    for (int i = 7; i >= 0; i--) {
-        gpio_set_level(SR_DATA, (green_inv >> i) & 1);
-        gpio_set_level(SR_CLOCK, 0);
-        gpio_set_level(SR_CLOCK, 1);
+
+    for (int c = 0; c < NUM_COLS; c++) {
+        gpio_reset_pin(columnas_rojo[c]);
+        gpio_set_direction(columnas_rojo[c], GPIO_MODE_OUTPUT);
+        gpio_set_level(columnas_rojo[c], 1);
     }
- 
-    /* Pulso de latch: transferir a salidas */
-    gpio_set_level(SR_LATCH, 0);
-    gpio_set_level(SR_LATCH, 1);
-}
 
-
-/* ================================================================
- * CONFIGURACION GPIO
- * ================================================================ */
-
-
-static void configure_gpio(void) {
-    /* Filas como salida */
-    for (int i = 0; i < 8; i++) {
-        gpio_config_t conf = {
-            .pin_bit_mask  = (1ULL << ROW_PINS[i]),
-            .mode          = GPIO_MODE_OUTPUT,
-            .pull_up_en    = GPIO_PULLUP_DISABLE,
-            .pull_down_en  = GPIO_PULLDOWN_DISABLE,
-            .intr_type     = GPIO_INTR_DISABLE
-        };
-        gpio_config(&conf);
-        gpio_set_level(ROW_PINS[i], 0);
+    for (int c = 0; c < NUM_COLS_VERDE; c++) {
+        gpio_reset_pin(columnas_verde[c]);
+        gpio_set_direction(columnas_verde[c], GPIO_MODE_OUTPUT);
+        gpio_set_level(columnas_verde[c], 1);
     }
- 
-    /* Pines 595 como salida */
-    gpio_config_t sr_conf = {
-        .pin_bit_mask = (1ULL << SR_DATA) |
-                        (1ULL << SR_CLOCK) |
-                        (1ULL << SR_LATCH),
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE
-    };
-    gpio_config(&sr_conf);
-    gpio_set_level(SR_DATA, 0);
-    gpio_set_level(SR_CLOCK, 0);
-    gpio_set_level(SR_LATCH, 0);
- 
-    /* Apagar todos los LEDs */
-    sr_send_16bits(0x00, 0x00);
- 
-    /* Botones como entrada (pull-down externo, sin pull interno) */
-    gpio_config_t btn_conf = {
-        .pin_bit_mask = (1ULL << BTN_LEFT) |
-                        (1ULL << BTN_RIGHT) |
-                        (1ULL << BTN_DROP),
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE
-    };
-    gpio_config(&btn_conf);
+
+    gpio_reset_pin(BTN_IZQ);
+    gpio_set_direction(BTN_IZQ, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BTN_IZQ, GPIO_PULLUP_ONLY);
+
+    gpio_reset_pin(BTN_DER);
+    gpio_set_direction(BTN_DER, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BTN_DER, GPIO_PULLUP_ONLY);
+
+    gpio_reset_pin(BTN_DROP);
+    gpio_set_direction(BTN_DROP, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BTN_DROP, GPIO_PULLUP_ONLY);
 }
 
+// -------------------------
+// DISPLAY
+// -------------------------
+void mostrar_pantalla(void)
+{
+    for (int f = 0; f < NUM_FILAS; f++) {
 
-/* ================================================================
- * CONFIGURACION TIMER (como se vio en clase)
- * ================================================================ */
- 
-static void configure_fall_timer(void) {
-    timer_config_t config = {
-        .divider     = FALL_TIMER_DIVIDER,
-        .counter_dir = TIMER_COUNT_UP,
-        .counter_en  = TIMER_PAUSE,
-        .alarm_en    = TIMER_ALARM_EN,
-        .auto_reload = true
-    };
-    timer_init(FALL_TIMER_GROUP, FALL_TIMER_IDX, &config);
-    timer_set_counter_value(FALL_TIMER_GROUP, FALL_TIMER_IDX, 0);
-    timer_set_alarm_value(FALL_TIMER_GROUP, FALL_TIMER_IDX, fall_interval_us);
-    timer_isr_callback_add(FALL_TIMER_GROUP, FALL_TIMER_IDX,
-                           timer_fall_isr, NULL, 0);
-    timer_enable_intr(FALL_TIMER_GROUP, FALL_TIMER_IDX);
-    timer_start(FALL_TIMER_GROUP, FALL_TIMER_IDX);
-}
- 
-static void update_fall_speed(void) {
-    int64_t new_val = (int64_t)FALL_INTERVAL_US - (int64_t)(score / 3) * 50000;
-    if (new_val < 200000) new_val = 200000;
-    fall_interval_us = (uint64_t)new_val;
-    timer_set_alarm_value(FALL_TIMER_GROUP, FALL_TIMER_IDX, fall_interval_us);
-}
-
-
-/* ================================================================
- * MULTIPLEXADO DE LA MATRIZ
- *
- * Anodo comun: fila HIGH + catodo LOW = LED encendido
- * Se barre fila por fila. Cada barrido completo ~2ms -> ~500Hz
- * ================================================================ */
-
- static void display_scan_row(int row) {
-    /* Apagar fila anterior */
-    for (int r = 0; r < 8; r++)
-        gpio_set_level(ROW_PINS[r], 0);
- 
-    /* Enviar datos de columnas por los 595 */
-    sr_send_16bits(disp_red[row], disp_green[row]);
- 
-    /* Activar esta fila */
-    gpio_set_level(ROW_PINS[row], 1);
-}
- 
-static void full_scan(void) {
-    for (int row = 0; row < 8; row++) {
-        display_scan_row(row);
-        for (volatile int d = 0; d < 300; d++);
-        gpio_set_level(ROW_PINS[row], 0);
-    }
-}
-
-
-/* ================================================================
- * POLLING DE BOTONES (con debounce por tiempo)
- *
- * Botones con pull-down externo: presionado = HIGH (1)
- * Se detecta flanco de subida (no estaba presionado -> presionado)
- * ================================================================ */
-
-typedef struct {
-    gpio_num_t pin;
-    bool last_state;
-    int64_t last_press_time;
-    bool pressed;           /* flag de evento: "se acaba de presionar" */
-} button_t;
- 
-static button_t btn_left  = { BTN_LEFT,  false, 0, false };
-static button_t btn_right = { BTN_RIGHT, false, 0, false };
-static button_t btn_drop  = { BTN_DROP,  false, 0, false };
- 
-static void poll_button(button_t *btn) {
-    btn->pressed = false;
-    bool current = (gpio_get_level(btn->pin) == 1);
-    int64_t now = esp_timer_get_time();
- 
-    /* Flanco de subida + debounce */
-    if (current && !btn->last_state) {
-        if ((now - btn->last_press_time) > (DEBOUNCE_MS * 1000)) {
-            btn->pressed = true;
-            btn->last_press_time = now;
+        for (int i = 0; i < NUM_FILAS; i++) {
+            gpio_set_level(filas[i], 0);
         }
-    }
-    btn->last_state = current;
-}
- 
-static void poll_all_buttons(void) {
-    poll_button(&btn_left);
-    poll_button(&btn_right);
-    poll_button(&btn_drop);
-}
 
-
-/* ================================================================
- * LOGICA DEL JUEGO
- * ================================================================ */
-
- static bool piece_fits(int pidx, int row, int col) {
-    const piece_t *p = &PIECES[pidx];
-    for (int i = 0; i < p->num_blocks; i++) {
-        int r = row + p->blocks[i][0];
-        int c = col + p->blocks[i][1];
-        if (r < 0 || r >= BOARD_H || c < 0 || c >= BOARD_W) return false;
-        if (board[r][c]) return false;
-    }
-    return true;
-}
- 
-static void lock_piece(void) {
-    const piece_t *p = &PIECES[cur_piece];
-    for (int i = 0; i < p->num_blocks; i++) {
-        int r = piece_row + p->blocks[i][0];
-        int c = piece_col + p->blocks[i][1];
-        if (r >= 0 && r < BOARD_H && c >= 0 && c < BOARD_W)
-            board[r][c] = 1;
-    }
-}
- 
-static int clear_lines(void) {
-    int cleared = 0;
-    flash_rows_mask = 0;
-    for (int r = 0; r < BOARD_H; r++) {
-        bool full = true;
-        for (int c = 0; c < BOARD_W; c++) {
-            if (!board[r][c]) { full = false; break; }
+        for (int c = 0; c < NUM_COLS; c++) {
+            gpio_set_level(columnas_rojo[c], 1);
         }
-        if (full) {
-            flash_rows_mask |= (1 << r);
-            cleared++;
+
+        for (int c = 0; c < NUM_COLS_VERDE; c++) {
+            gpio_set_level(columnas_verde[c], 1);
         }
-    }
-    if (cleared > 0) {
-        flash_active = true;
-        flash_count = 0;
-    }
-    return cleared;
-}
- 
-static void remove_marked_lines(void) {
-    /*
-     * Estrategia: copiar las filas NO marcadas a un tablero temporal
-     * de abajo hacia arriba, y luego copiar de vuelta.
-     * Esto evita el bug de desplazar con mascara desactualizada.
-     */
-    uint8_t temp[BOARD_H][BOARD_W];
-    memset(temp, 0, sizeof(temp));
- 
-    int dest = BOARD_H - 1;  /* escribir desde abajo */
-    for (int src = BOARD_H - 1; src >= 0; src--) {
-        if (!(flash_rows_mask & (1 << src))) {
-            /* Esta fila NO fue eliminada, copiarla */
-            memcpy(temp[dest], board[src], BOARD_W);
-            dest--;
-        }
-    }
-    /* Las filas restantes (dest..0) quedan en 0 (ya inicializadas) */
-    memcpy(board, temp, sizeof(board));
-    flash_rows_mask = 0;
-}
- 
-static void spawn_piece(void) {
-    cur_piece = random_piece();
-    piece_row = 0;
-    piece_col = (BOARD_W - PIECES[cur_piece].width) / 2;
-    if (!piece_fits(cur_piece, piece_row, piece_col))
-        game_over = true;
-}
- 
-/* Colocar pieza y verificar lineas */
-static void place_and_check(void) {
-    lock_piece();
-    int cl = clear_lines();
-    if (cl > 0) {
-        score += cl;
-        update_fall_speed();
-    }
-    if (!flash_active) {
-        remove_marked_lines();
-        spawn_piece();
-    }
-}
 
-
-/* ================================================================
- * ACTUALIZACION DE DISPLAY
- * ================================================================ */
-
-static void update_display(void) {
-    memset(disp_red, 0, sizeof(disp_red));
-    memset(disp_green, 0, sizeof(disp_green));
- 
-    /* Tablero (piezas colocadas) en ROJO */
-    for (int r = 0; r < BOARD_H; r++)
-        for (int c = 0; c < BOARD_W; c++)
-            if (board[r][c])
-                disp_red[r] |= (1 << c);
- 
-    /* Flash: lineas completas en AMARILLO */
-    if (flash_active) {
-        for (int r = 0; r < BOARD_H; r++) {
-            if (flash_rows_mask & (1 << r)) {
-                if (flash_count % 2 == 0) {
-                    disp_red[r]   = 0xFF;
-                    disp_green[r] = 0xFF;
-                } else {
-                    disp_red[r]   = 0x00;
-                    disp_green[r] = 0x00;
+        for (int c = 0; c < NUM_COLS; c++) {
+            if (pantalla[f][c] == 1) {
+                gpio_set_level(columnas_rojo[c], 0);
+            }
+            else if (pantalla[f][c] == 2) {
+                if (c < NUM_COLS_VERDE) {
+                    gpio_set_level(columnas_verde[c], 0);
                 }
             }
         }
-        return;
+
+        gpio_set_level(filas[f], 1);
+        esp_rom_delay_us(700);
     }
- 
-    /* Pieza activa en VERDE */
-    if (!game_over) {
-        const piece_t *p = &PIECES[cur_piece];
-        for (int i = 0; i < p->num_blocks; i++) {
-            int r = piece_row + p->blocks[i][0];
-            int c = piece_col + p->blocks[i][1];
-            if (r >= 0 && r < BOARD_H && c >= 0 && c < BOARD_W)
-                disp_green[r] |= (1 << c);
+}
+
+// -------------------------
+// MANEJO DE MATRICES
+// -------------------------
+void limpiar_tablero(void)
+{
+    for (int f = 0; f < NUM_FILAS; f++) {
+        for (int c = 0; c < NUM_COLS; c++) {
+            tablero[f][c] = 0;
         }
     }
 }
 
-
-/* ================================================================
- * ANIMACIONES
- * ================================================================ */
- 
-static void game_over_animation(void) {
-    /* Llenar de rojo de abajo hacia arriba */
-    for (int r = BOARD_H - 1; r >= 0; r--) {
-        disp_red[r] = 0xFF;
-        disp_green[r] = 0x00;
-        for (int t = 0; t < 80; t++)
-            full_scan();
-    }
-    /* Parpadear 3 veces */
-    for (int blink = 0; blink < 6; blink++) {
-        for (int r = 0; r < BOARD_H; r++)
-            disp_red[r] = (blink % 2 == 0) ? 0xFF : 0x00;
-        for (int t = 0; t < 80; t++)
-            full_scan();
+void copiar_tablero_a_pantalla(void)
+{
+    for (int f = 0; f < NUM_FILAS; f++) {
+        for (int c = 0; c < NUM_COLS; c++) {
+            pantalla[f][c] = tablero[f][c];
+        }
     }
 }
- 
-static void reset_game(void) {
-    memset(board, 0, sizeof(board));
-    score = 0;
-    game_over = false;
-    flash_active = false;
-    flash_rows_mask = 0;
-    fall_interval_us = FALL_INTERVAL_US;
-    rng_state = (uint32_t)(esp_timer_get_time() & 0xFFFFFFFF);
-    if (rng_state == 0) rng_state = 42;
-    timer_set_alarm_value(FALL_TIMER_GROUP, FALL_TIMER_IDX, fall_interval_us);
-    timer_set_counter_value(FALL_TIMER_GROUP, FALL_TIMER_IDX, 0);
-    spawn_piece();
-    update_display();
+
+void limpiar_pantalla_total(void)
+{
+    for (int f = 0; f < NUM_FILAS; f++) {
+        for (int c = 0; c < NUM_COLS; c++) {
+            pantalla[f][c] = 0;
+        }
+    }
 }
 
+void dibujar_pixel_color(int f, int c, uint8_t color)
+{
+    if (f >= 0 && f < NUM_FILAS && c >= 0 && c < NUM_COLS) {
+        pantalla[f][c] = color;
+    }
+}
 
-/* ================================================================
- * app_main
- * ================================================================ */
+// -------------------------
+// PIEZAS
+// tipo 0:
+// o x o
+// x x x
+//
+// tipo 1:
+// x x
+// x x
+//
+// tipo 2:
+// x
+// x
+// x
+//
+// tipo 3:
+// x o
+// x x
+// x o
+//
+// tipo 4:
+// o x
+// x x
+// o x
+// -------------------------
+void dibujar_pieza(int tipo, int y, int x, uint8_t color)
+{
+    if (tipo == 0) {
+        dibujar_pixel_color(y,   x,   color);
+        dibujar_pixel_color(y+1, x-1, color);
+        dibujar_pixel_color(y+1, x,   color);
+        dibujar_pixel_color(y+1, x+1, color);
+    }
 
- void app_main(void) {
-    /* 1. Configurar hardware */
-    configure_gpio();
- 
-    /* 2. Inicializar juego */
-    rng_state = (uint32_t)(esp_timer_get_time() & 0xFFFFFFFF);
-    if (rng_state == 0) rng_state = 42;
-    memset(board, 0, sizeof(board));
-    spawn_piece();
-    update_display();
- 
-    /* 3. Iniciar timer de caida */
-    configure_fall_timer();
- 
-    /* 4. Bucle principal */
-    while (1) {
- 
-        /* Leer botones por polling */
-        poll_all_buttons();
- 
-        /* --- GAME OVER --- */
-        if (game_over) {
-            if (btn_left.pressed || btn_right.pressed || btn_drop.pressed) {
-                reset_game();
-                timer_start(FALL_TIMER_GROUP, FALL_TIMER_IDX);
-            }
-            full_scan();
-            continue;
+    if (tipo == 1) {
+        dibujar_pixel_color(y,   x,   color);
+        dibujar_pixel_color(y,   x+1, color);
+        dibujar_pixel_color(y+1, x,   color);
+        dibujar_pixel_color(y+1, x+1, color);
+    }
+
+    if (tipo == 2) { // línea de 3
+        dibujar_pixel_color(y,   x, color);
+        dibujar_pixel_color(y+1, x, color);
+        dibujar_pixel_color(y+2, x, color);
+    }
+
+    if (tipo == 3) {
+        dibujar_pixel_color(y,   x-1, color);
+        dibujar_pixel_color(y+1, x-1, color);
+        dibujar_pixel_color(y+1, x,   color);
+        dibujar_pixel_color(y+2, x-1, color);
+    }
+
+    if (tipo == 4) {
+        dibujar_pixel_color(y,   x,   color);
+        dibujar_pixel_color(y+1, x-1, color);
+        dibujar_pixel_color(y+1, x,   color);
+        dibujar_pixel_color(y+2, x,   color);
+    }
+}
+
+// -------------------------
+// COLISIÓN
+// -------------------------
+int colision(int tipo, int y, int x)
+{
+    int coords[4][2];
+    int n = 0;
+
+    if (tipo == 0) {
+        int t[4][2] = {{y,x},{y+1,x-1},{y+1,x},{y+1,x+1}};
+        for (int i = 0; i < 4; i++) {
+            coords[i][0] = t[i][0];
+            coords[i][1] = t[i][1];
         }
- 
-        /* --- FLASH (lineas eliminadas) --- */
-        if (flash_active) {
-            flag_fall = false;
-            flash_count++;
-            update_display();
-            if (flash_count >= 6) {
-                flash_active = false;
-                remove_marked_lines();
-                spawn_piece();
-                update_display();
-            }
-            for (int t = 0; t < 40; t++)
-                full_scan();
-            continue;
+        n = 4;
+    }
+
+    if (tipo == 1) {
+        int t[4][2] = {{y,x},{y,x+1},{y+1,x},{y+1,x+1}};
+        for (int i = 0; i < 4; i++) {
+            coords[i][0] = t[i][0];
+            coords[i][1] = t[i][1];
         }
- 
-        /* --- CONTROLES --- */
-        if (btn_left.pressed) {
-            if (piece_fits(cur_piece, piece_row, piece_col - 1))
-                piece_col--;
-            update_display();
+        n = 4;
+    }
+
+    if (tipo == 2) {
+        int t[3][2] = {{y,x},{y+1,x},{y+2,x}};
+        for (int i = 0; i < 3; i++) {
+            coords[i][0] = t[i][0];
+            coords[i][1] = t[i][1];
         }
- 
-        if (btn_right.pressed) {
-            if (piece_fits(cur_piece, piece_row, piece_col + 1))
-                piece_col++;
-            update_display();
+        n = 3;
+    }
+
+    if (tipo == 3) {
+        int t[4][2] = {{y,x-1},{y+1,x-1},{y+1,x},{y+2,x-1}};
+        for (int i = 0; i < 4; i++) {
+            coords[i][0] = t[i][0];
+            coords[i][1] = t[i][1];
         }
- 
-        if (btn_drop.pressed) {
-            /* Hard drop: bajar hasta el fondo */
-            while (piece_fits(cur_piece, piece_row + 1, piece_col))
-                piece_row++;
-            place_and_check();
-            update_display();
+        n = 4;
+    }
+
+    if (tipo == 4) {
+        int t[4][2] = {{y,x},{y+1,x-1},{y+1,x},{y+2,x}};
+        for (int i = 0; i < 4; i++) {
+            coords[i][0] = t[i][0];
+            coords[i][1] = t[i][1];
         }
- 
-        /* --- CAIDA PERIODICA (flag del timer ISR) --- */
-        if (flag_fall) {
-            flag_fall = false;
-            if (piece_fits(cur_piece, piece_row + 1, piece_col)) {
-                piece_row++;
+        n = 4;
+    }
+
+    for (int i = 0; i < n; i++) {
+        int f = coords[i][0];
+        int c = coords[i][1];
+
+        if (c < 0 || c >= NUM_COLS) return 1;
+        if (f >= NUM_FILAS) return 1;
+
+        if (f >= 0 && tablero[f][c] != 0) return 1;
+    }
+
+    return 0;
+}
+
+// -------------------------
+// ANIMACIONES
+// -------------------------
+void mostrar_frames(int repeticiones)
+{
+    for (int i = 0; i < repeticiones; i++) {
+        mostrar_pantalla();
+    }
+}
+
+void animar_fila_verde(int fila)
+{
+    for (int rep = 0; rep < 4; rep++) {
+
+        copiar_tablero_a_pantalla();
+
+        for (int c = 0; c < NUM_COLS; c++) {
+            if (c < NUM_COLS_VERDE) {
+                pantalla[fila][c] = 2;
             } else {
-                place_and_check();
+                pantalla[fila][c] = 1;
             }
-            update_display();
         }
- 
-        /* --- GAME OVER CHECK --- */
-        if (game_over) {
-            timer_pause(FALL_TIMER_GROUP, FALL_TIMER_IDX);
-            game_over_animation();
+
+        mostrar_frames(80);
+
+        copiar_tablero_a_pantalla();
+
+        for (int c = 0; c < NUM_COLS; c++) {
+            pantalla[fila][c] = 0;
+        }
+
+        mostrar_frames(80);
+    }
+}
+
+// X game over EXACTA como la pediste, en 4x7 verde
+void dibujar_x_game_over_verde(void)
+{
+    limpiar_pantalla_total();
+
+    // Fila 0: X o X o
+    pantalla[0][0] = 2;
+    pantalla[0][2] = 2;
+
+    // Fila 1: o X o o
+    pantalla[1][1] = 2;
+
+    // Fila 2: X o X o
+    pantalla[2][0] = 2;
+    pantalla[2][2] = 2;
+
+    // Fila 3: o o o o
+    // nada
+
+    // Fila 4: o X o X
+    pantalla[4][1] = 2;
+    pantalla[4][3] = 2;
+
+    // Fila 5: o o X o
+    pantalla[5][2] = 2;
+
+    // Fila 6: o X o X
+    pantalla[6][1] = 2;
+    pantalla[6][3] = 2;
+}
+
+void animacion_game_over_x(void)
+{
+    for (int rep = 0; rep < 8; rep++) {
+        dibujar_x_game_over_verde();
+        mostrar_frames(110);
+
+        limpiar_pantalla_total();
+        mostrar_frames(90);
+    }
+}
+
+// -------------------------
+// BORRAR FILA Y GRAVEDAD
+// -------------------------
+void borrar_fila(int fila)
+{
+    for (int c = 0; c < NUM_COLS; c++) {
+        tablero[fila][c] = 0;
+    }
+}
+
+int aplicar_gravedad_un_paso(void)
+{
+    int hubo_cambio = 0;
+
+    for (int f = NUM_FILAS - 2; f >= 0; f--) {
+        for (int c = 0; c < NUM_COLS; c++) {
+            if (tablero[f][c] != 0 && tablero[f+1][c] == 0) {
+                tablero[f+1][c] = tablero[f][c];
+                tablero[f][c] = 0;
+                hubo_cambio = 1;
+            }
+        }
+    }
+
+    return hubo_cambio;
+}
+
+void aplicar_gravedad_completa(void)
+{
+    while (aplicar_gravedad_un_paso()) {
+        copiar_tablero_a_pantalla();
+        mostrar_frames(35);
+    }
+}
+
+// -------------------------
+// REVISAR FILAS
+// -------------------------
+void revisar_filas(void)
+{
+    int hubo_linea = 1;
+
+    while (hubo_linea) {
+        hubo_linea = 0;
+
+        for (int f = 0; f < NUM_FILAS; f++) {
+            int completa = 1;
+
+            for (int c = 0; c < NUM_COLS; c++) {
+                if (tablero[f][c] == 0) {
+                    completa = 0;
+                    break;
+                }
+            }
+
+            if (completa) {
+                animar_fila_verde(f);
+                borrar_fila(f);
+                aplicar_gravedad_completa();
+                hubo_linea = 1;
+                break;
+            }
+        }
+    }
+}
+
+// -------------------------
+// FIJAR PIEZA
+// -------------------------
+void fijar_pieza(int tipo, int y, int x)
+{
+    copiar_tablero_a_pantalla();
+    dibujar_pieza(tipo, y, x, 1);
+
+    for (int f = 0; f < NUM_FILAS; f++) {
+        for (int c = 0; c < NUM_COLS; c++) {
+            if (pantalla[f][c] != 0) {
+                tablero[f][c] = pantalla[f][c];
+            }
+        }
+    }
+
+    revisar_filas();
+}
+
+// -------------------------
+// GAME OVER
+// Se pierde si queda al menos una casilla ocupada en la primera fila
+// -------------------------
+int hay_game_over(void)
+{
+    for (int c = 0; c < NUM_COLS; c++) {
+        if (tablero[0][c] != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// -------------------------
+// JUEGO
+// -------------------------
+void juego(void)
+{
+    while (1)
+    {
+        int tipo = rand() % 5;
+        int x = 2;
+        int y = -3;
+
+        int velocidad = 120;
+        int contador_caida = 0;
+        int contador_mov = 0;
+
+        if (hay_game_over()) {
+            animacion_game_over_x();
+            limpiar_tablero();
             continue;
         }
- 
-        /* --- MULTIPLEXADO (un barrido completo) --- */
-        full_scan();
+
+        while (1)
+        {
+            contador_mov++;
+
+            if (contador_mov > 20) {
+                contador_mov = 0;
+
+                if (!gpio_get_level(BTN_IZQ) && !colision(tipo, y, x - 1)) {
+                    x--;
+                }
+
+                if (!gpio_get_level(BTN_DER) && !colision(tipo, y, x + 1)) {
+                    x++;
+                }
+            }
+
+            if (!gpio_get_level(BTN_DROP)) {
+                velocidad = 10;
+            } else {
+                velocidad = 120;
+            }
+
+            contador_caida++;
+            if (contador_caida > velocidad) {
+                contador_caida = 0;
+
+                if (!colision(tipo, y + 1, x)) {
+                    y++;
+                } else {
+                    fijar_pieza(tipo, y, x);
+                    break;
+                }
+            }
+
+            copiar_tablero_a_pantalla();
+            dibujar_pieza(tipo, y, x, 1);
+            mostrar_pantalla();
+        }
     }
+}
+
+// -------------------------
+// MAIN
+// -------------------------
+void app_main(void)
+{
+    configurar_pines();
+    limpiar_tablero();
+    juego();
 }
