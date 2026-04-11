@@ -62,22 +62,6 @@ Los botones se leen por polling dentro del loop principal. Se usa un contador de
 - Si una fila queda completamente llena, se reproduce una animación de parpadeo en verde y luego se elimina, aplicando gravedad bloque a bloque hacia abajo.
 - La condición de **Game Over** se evalúa al inicio de cada nueva pieza: si hay al menos una celda ocupada en la fila 0, se muestra una animación de dos "X" verdes parpadeantes y el tablero se reinicia.
 
-## Estructura del código
 
-| Sección | Descripción |
-|---|---|
-| `configurar_pines()` | Inicializa GPIOs de filas, columnas y botones |
-| `mostrar_pantalla()` | Multiplexación de la matriz (1 frame completo) |
-| `dibujar_pieza()` | Escribe una pieza en el buffer `pantalla` |
-| `colision()` | Verifica si una pieza puede ocupar una posición |
-| `fijar_pieza()` | Ancla la pieza al tablero y revisa filas completas |
-| `revisar_filas()` | Busca y elimina filas llenas con animación |
-| `aplicar_gravedad_completa()` | Baja bloques flotantes tras eliminar una fila |
-| `animacion_game_over_x()` | Parpadeo de "X" verdes al perder |
-| `juego()` | Loop principal del juego |
-| `app_main()` | Punto de entrada ESP-IDF |
 
-## Build
-
-Proyecto ESP-IDF estándar. Compilar y flashear con:
 
