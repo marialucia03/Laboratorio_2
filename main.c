@@ -9,15 +9,16 @@
 #define NUM_COLS  5
 #define NUM_COLS_VERDE 4
 
-// -------------------------
+
 // PINES MATRIZ
-// -------------------------
+
 gpio_num_t filas[NUM_FILAS] = {
     GPIO_NUM_16, GPIO_NUM_17, GPIO_NUM_18, GPIO_NUM_19,
     GPIO_NUM_21, GPIO_NUM_22, GPIO_NUM_23
 };
 
 // Juego normal en rojo
+
 gpio_num_t columnas_rojo[NUM_COLS] = {
     GPIO_NUM_27, GPIO_NUM_26, GPIO_NUM_25, GPIO_NUM_33, GPIO_NUM_5
 };
@@ -27,25 +28,20 @@ gpio_num_t columnas_verde[NUM_COLS_VERDE] = {
     GPIO_NUM_4, GPIO_NUM_15, GPIO_NUM_2, GPIO_NUM_32
 };
 
-// -------------------------
+
 // BOTONES
-// -------------------------
+
 #define BTN_IZQ   GPIO_NUM_13
 #define BTN_DER   GPIO_NUM_14
 #define BTN_DROP  GPIO_NUM_12
 
-// -------------------------
+
 // MATRICES
-// 0 = apagado
-// 1 = rojo
-// 2 = verde
-// -------------------------
+
 uint8_t pantalla[NUM_FILAS][NUM_COLS];
 uint8_t tablero[NUM_FILAS][NUM_COLS];
 
-// -------------------------
-// CONFIGURACIÓN
-// -------------------------
+
 void configurar_pines(void)
 {
     for (int f = 0; f < NUM_FILAS; f++) {
@@ -79,9 +75,9 @@ void configurar_pines(void)
     gpio_set_pull_mode(BTN_DROP, GPIO_PULLUP_ONLY);
 }
 
-// -------------------------
+
 // DISPLAY
-// -------------------------
+
 void mostrar_pantalla(void)
 {
     for (int f = 0; f < NUM_FILAS; f++) {
@@ -114,9 +110,8 @@ void mostrar_pantalla(void)
     }
 }
 
-// -------------------------
 // MANEJO DE MATRICES
-// -------------------------
+
 void limpiar_tablero(void)
 {
     for (int f = 0; f < NUM_FILAS; f++) {
@@ -151,31 +146,6 @@ void dibujar_pixel_color(int f, int c, uint8_t color)
     }
 }
 
-// -------------------------
-// PIEZAS
-// tipo 0:
-// o x o
-// x x x
-//
-// tipo 1:
-// x x
-// x x
-//
-// tipo 2:
-// x
-// x
-// x
-//
-// tipo 3:
-// x o
-// x x
-// x o
-//
-// tipo 4:
-// o x
-// x x
-// o x
-// -------------------------
 void dibujar_pieza(int tipo, int y, int x, uint8_t color)
 {
     if (tipo == 0) {
@@ -213,9 +183,8 @@ void dibujar_pieza(int tipo, int y, int x, uint8_t color)
     }
 }
 
-// -------------------------
 // COLISIÓN
-// -------------------------
+
 int colision(int tipo, int y, int x)
 {
     int coords[4][2];
@@ -279,9 +248,8 @@ int colision(int tipo, int y, int x)
     return 0;
 }
 
-// -------------------------
 // ANIMACIONES
-// -------------------------
+
 void mostrar_frames(int repeticiones)
 {
     for (int i = 0; i < repeticiones; i++) {
@@ -315,7 +283,6 @@ void animar_fila_verde(int fila)
     }
 }
 
-// X game over EXACTA como la pediste, en 4x7 verde
 void dibujar_x_game_over_verde(void)
 {
     limpiar_pantalla_total();
@@ -357,9 +324,6 @@ void animacion_game_over_x(void)
     }
 }
 
-// -------------------------
-// BORRAR FILA Y GRAVEDAD
-// -------------------------
 void borrar_fila(int fila)
 {
     for (int c = 0; c < NUM_COLS; c++) {
@@ -392,9 +356,6 @@ void aplicar_gravedad_completa(void)
     }
 }
 
-// -------------------------
-// REVISAR FILAS
-// -------------------------
 void revisar_filas(void)
 {
     int hubo_linea = 1;
@@ -423,9 +384,9 @@ void revisar_filas(void)
     }
 }
 
-// -------------------------
+
 // FIJAR PIEZA
-// -------------------------
+
 void fijar_pieza(int tipo, int y, int x)
 {
     copiar_tablero_a_pantalla();
@@ -444,8 +405,7 @@ void fijar_pieza(int tipo, int y, int x)
 
 // -------------------------
 // GAME OVER
-// Se pierde si queda al menos una casilla ocupada en la primera fila
-// -------------------------
+
 int hay_game_over(void)
 {
     for (int c = 0; c < NUM_COLS; c++) {
@@ -456,9 +416,9 @@ int hay_game_over(void)
     return 0;
 }
 
-// -------------------------
+
 // JUEGO
-// -------------------------
+
 void juego(void)
 {
     while (1)
@@ -517,10 +477,6 @@ void juego(void)
         }
     }
 }
-
-// -------------------------
-// MAIN
-// -------------------------
 void app_main(void)
 {
     configurar_pines();
